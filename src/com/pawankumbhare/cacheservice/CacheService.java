@@ -2,9 +2,12 @@ package com.pawankumbhare.cacheservice;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.Serializable;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.Iterator;
 import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.PriorityBlockingQueue;
@@ -12,49 +15,57 @@ import java.util.concurrent.PriorityBlockingQueue;
 import com.esotericsoftware.kryo.Kryo;
 import com.esotericsoftware.kryo.io.Input;
 import com.esotericsoftware.kryo.io.Output;
-import com.pawankumbhare.data_structure.ConcurrentLRU;
+import com.pawankumbhare.data_structure.LFUCache;
 
-/* Kyro ver 4.0.0 is used to serialize and deserialize unknown objects as objects sent by client may or may not be serializable.
- * Dependency on 4 jar files - 
- *  1) kryo-4.0.0
- *  2) objenesis-2.1.jar
- *  3) minlog-1.3.0.jar
- *  4) reflectasm-1.10.1-shaded.jar 
+/* Kyro v4.0.1 is used to serialize and deserialize any object which may or may not implement serializable interface.
+ * Dependencies - https://github.com/EsotericSoftware/kryo
+ *  1) kryo-4.0.1.jar
+ *  2) kryo-4.0.1-javadoc.jar
+ *  3) kryo-4.0.1-sources.jar
+ *  4) objenesis-2.1.jar
+ *  5) minlog-1.3.0.jar
+ *  6) reflectasm-1.10.1-shaded.jar 
  */
 
-public class CacheService {
+public final class CacheService implements Serializable, Cloneable {
 
-	private static CacheService instance = null;
-	private volatile static PriorityBlockingQueue<CachedObject> expiryPQ; // Thread safe Min Priority Queue.
-	private volatile static ConcurrentLRU<String, CachedObject> lru; // Thread safe Least Recently Used Cache.
-	private static final int ITITIAL_LRU_CAPACITY = 1000; // Initial LRU capacity.
-	private static final int EXPIRY_CHECK_INTERVAL = 1 * 1000; // Interval to check for expired object. // 1 secs
-	private static final String EXT = ".cache"; // Extension for deserialized objects.
+	private   static final long   serialVersionUID 				= 402566264949198429L;
+	private   static final int	  INITIAL_CACHE_CAPACITY		= 100; 		// Initial cache capacity.
+	protected static final int 	  EXPIRED_OBJECT_CHECK_INTERVAL = 1 * 1000; // Interval to check for expired object -> 1 sec
+	private   static final String EXTENSION 					= ".obj"; 	// Extension for deserialized objects.
+	
+	private volatile static	ExpiredObjectManager			   expiredObjMgr;
+	private volatile static Timer							   timer;
+	private volatile static	CacheService 					   instance;	// Single instance's reference of CacheService
+	private	volatile static PriorityBlockingQueue<CacheObject> expiryQueue;	// Thread safe Minimum Priority Queue.
+	private	volatile static LFUCache<String, CacheObject> 	   lfu; 		// Least Frequently Used Cache.
 	
 	/*
-	 * CacheService Constructor.
+	 * Constructor.
 	 */
 	private CacheService() {
-		// Initally system will reserve space for 1000 objects
-		expiryPQ = new PriorityBlockingQueue<>(1000, new Comparator<CachedObject>() { // Initializing Thread Safe Min Priority Queue
+		// Initally system will reserve space for INITIAL_CACHE_CAPACITY times object.
+		expiryQueue = new PriorityBlockingQueue<>(INITIAL_CACHE_CAPACITY, new Comparator<CacheObject>() {
 			@Override
-			public int compare(CachedObject o1, CachedObject o2) {
+			public int compare(CacheObject o1, CacheObject o2) {
 				return Long.compare(o1.getExpiryTime(), o2.getExpiryTime());
 			}
 		});
-		lru = new ConcurrentLRU<>(ITITIAL_LRU_CAPACITY); // Initializing Thread Safe LRU Cache with ITITIAL_LRU_CAPACITY
-		class ExpiredObjectManager extends TimerTask {
-            public void run() {
-            	CacheService.getInstance().checkAndRemoveExpiredObjects();
-            }
-        }
-		//Initializing timer object to call checkAndRemoveExipredObjects() in every EXPIRY_CHECK_INTERVAL
-        Timer timer = new Timer();
-        timer.schedule(new ExpiredObjectManager(), CachedObject.MIN_EXPIRY_ALLOWED, EXPIRY_CHECK_INTERVAL); 
+		lfu = new LFUCache<>(INITIAL_CACHE_CAPACITY); // Initializing LFU Cache with INITIAL_CACHE_CAPACITY
+		//Instantiating timer object to call checkExpiredObjects() in every EXPIRED_OBJECT_CHECK_INTERVAL
+        timer = new Timer();
+        expiredObjMgr = new ExpiredObjectManager();
+        timer.schedule(expiredObjMgr, CacheObject.MIN_EXPIRE_TIME, EXPIRED_OBJECT_CHECK_INTERVAL); 
 	}
 	
+	class ExpiredObjectManager extends TimerTask {
+        public void run() {
+        	CacheService.getInstance().checkExpiredObjects();
+        }
+    }
+	
 	/*
-	 * CacheService is a Singleton class, so accessing its instance via getInstance() method. 
+	 * CacheService is a Singleton class, its single instance can be accessed via getInstance() method. 
 	 */
 	public static CacheService getInstance() {
 		if (instance == null) {
@@ -66,22 +77,148 @@ public class CacheService {
 	}
 	
 	/*
-	 * Serialize objects if get removed from LRU cache
+	 * To maintain Singleton Pattern by preventing Serialization of CacheService's object.
 	 */
-	private boolean serialize(CachedObject cachedObj) {
+	public Object readResolve() {
+        return instance;
+    }
+	
+	/*
+	 * To maintain Singleton Pattern by preventing Cloning of CacheService's object.
+	 */
+	public Object clone() {
+        return CacheService.getInstance();
+    }
+
+	/*
+	 * This method gets object by key from cache.
+	 * If in LFU cache 
+	 * 		If not expired -> returns the object
+	 * 		Else return null
+	 * Else If object exists in Disk
+	 * 		If not expired -> Deserialize and add in LFU cache and return the object
+	 * 		Else return null
+	 */
+	public Object get(String key) {
+		if (lfu.containsKey(key)) {
+			CacheObject cacheObj = (CacheObject) lfu.get(key);
+			if (!cacheObj.isExpired()) {
+				CacheObject tmpCacheObj = lfu.get(key);
+				if (tmpCacheObj != null) return tmpCacheObj.getCachedObject();
+			} else {
+				System.out.println("Key - " + cacheObj.getKey() + " is expired");
+				remove(cacheObj.getKey());
+				return null;
+			}
+		}
+		CacheObject cacheObj = deserialize(key);
+		if (cacheObj == null) return null;
+	    if (cacheObj.isExpired()) remove(cacheObj.getKey());
+	    else {
+	    	CacheObject removed = lfu.set(cacheObj.getKey(), cacheObj);
+	    	serialize(removed);
+	    	removeFromDisk(cacheObj.getKey());
+	    	return cacheObj.getCachedObject();
+	    }
+		return null;
+	}
+	
+	/*
+	 * This method will set object in LFU cache with DEFAULT_EXPIRE_TIME and if any object gets removed from LFU cache, 
+	 * system will serialize it to preserve memory.
+	 */
+	public void set(String key, Object object) {
+		if (!lfu.containsKey(key)) {
+			CacheObject cacheObj = new CacheObject(key, object);
+			expiryQueue.add(cacheObj);
+			CacheObject removed = lfu.set(key, cacheObj);
+			if (removed != null) serialize(removed);
+			System.out.println("Key - " + key + " will expire on " + new Date(cacheObj.getExpiryTime()).toString());
+		} else System.err.println("Key - " + key + " already exists");
+	}
+	
+	/*
+	 * This method will set object in LFU cache with user defined minutes between MIN_EXPIRE_TIME and MAX_EXPIRE_TIME 
+	 * and if any object gets removed from LFU cache, system will serialize it to preserve memory.
+	 */
+	public void set(String key, Object object, int minutes) {
+		if (!lfu.containsKey(key)) {
+			CacheObject cacheObj = new CacheObject(key, object, minutes);
+			if (cacheObj.getKey() == null) return;
+			expiryQueue.add(cacheObj);
+			CacheObject removed = lfu.set(key, cacheObj);
+			if (removed != null) serialize(removed);
+			System.out.println("Key - " + key + " will expire on " + new Date(cacheObj.getExpiryTime()).toString());
+		} else System.err.println("Key - " + key + " key already exists");
+	}
+	
+	/*
+	 * This method remove the expired objects from the cache.
+	 */
+	private void checkExpiredObjects() {
+		CacheObject obj = expiryQueue.peek();
+		if (obj != null && obj.isExpired()) {
+			System.out.println("Key - " + obj.getKey() + " is expired");
+			removeFromDisk(obj.getKey());
+			lfu.remove(obj.getKey());
+			expiryQueue.poll();
+		}
+	}
+	
+	/*
+	 * This method removes the serialized object from the disk.
+	 */
+	private void removeFromDisk(String key) {
+		try {
+			File file = new File(key + EXTENSION);
+			file.delete();
+		} catch (Exception e) {
+			System.err.println("Key - " + key + " not found");
+		}
+	}
+
+	/*
+	 * This method removes the object from the cache.
+	 */
+	public boolean remove(String key) {
+		removeFromDisk(key);
+		expiryQueue.remove(lfu.get(key));
+		lfu.remove(key);
+		return true;
+	}
+
+	/*
+	 * This method stops the CacheService and removes all data and objects
+	 */
+	public void stop() {
+		expiredObjMgr.cancel();
+		timer.cancel();
+		Iterator<CacheObject> itr = expiryQueue.iterator();
+		while (itr.hasNext()) {
+			String key = itr.next().getKey();
+			removeFromDisk(key);
+			lfu.remove(key);
+		}
+		expiryQueue.clear();
+		instance = null;
+	}
+	
+	/*
+	 * This method serializes the object
+	 */
+	private boolean serialize(CacheObject cacheObj) {
 		Kryo kryo = null;
 	    Output output = null;
 		try {
 			kryo = new Kryo();
-			kryo.register(CachedObject.class);
-			output = new Output(new FileOutputStream(cachedObj.getKey() + EXT));
-			kryo.writeObject(output, cachedObj);
+			kryo.register(CacheObject.class);
+			output = new Output(new FileOutputStream(cacheObj.getKey() + EXTENSION));
+			kryo.writeObject(output, cacheObj);
 		    output.close();
-		    System.out.println("SERIALIZED KEY : " + cachedObj.getKey());
+		    System.out.println("Serializing key - " + cacheObj.getKey());
 		    return true;
 		} catch (Exception e) {
-			e.printStackTrace();
-			System.err.println("Unable to serialize key " + cachedObj.getKey());
+			System.err.println("Unable to serialize key - " + cacheObj.getKey());
 		} finally {
 			if (output != null) output.close();
 		}
@@ -89,119 +226,29 @@ public class CacheService {
 	}
 	
 	/*
-	 * Check and deserialize objects if not found in LRU cache.
-	 * Will return the object, if cached object is not expired.
-	 * Otherwise will return null;
+	 * This method deserializes the object
 	 */
-	private CachedObject deserialize(String key) {
+	private CacheObject deserialize(String key) {
 		Kryo kryo = null;
 		Input input = null;
 		try {
 			kryo = new Kryo();
-			kryo.register(CachedObject.class);
-			input = new Input(new FileInputStream(key + EXT));
-			CachedObject cachedObj = kryo.readObject(input, CachedObject.class);
-		    System.out.println("DESERIALIZED KEY : " + cachedObj.getKey());
-		    return cachedObj;
+			kryo.register(CacheObject.class);
+			input = new Input(new FileInputStream(key + EXTENSION));
+			CacheObject cacheObj = kryo.readObject(input, CacheObject.class);
+		    System.out.println("Deserializing key - " + cacheObj.getKey());
+		    return cacheObj;
 		} catch (Exception e) {
-			System.err.println("Unable to deserialize key " + key);
+			if (!(e instanceof FileNotFoundException)) System.err.println("Unable to deserialize key - " + key);
 		} finally {
 		    if (input != null) input.close();
 		}
 		return null;
 	}
-
-	/*
-	 * Get cached object by key.
-	 * First check in LRU cache, if present return the cached object.
-	 * If not present in LRU cache, deserialize the object.
-	 * If found in disk check its expiry, if expired then return null.
-	 * If found in disk and not expired put in LRU cache and return cached object after removing retrieved copy from disk.
-	 */
-	public Object getObjectByKey(String key) {
-		if (lru.containsKey(key)) {
-			CachedObject cachedObj = (CachedObject) lru.get(key);
-			if (!cachedObj.isExpired()) {
-				CachedObject lruObject = lru.get(key);
-				if (lruObject != null) return lruObject.getObject();
-			} else System.err.println(cachedObj.getKey() + " key is expired.");
-		}
-		CachedObject cachedObj = deserialize(key);
-		if (cachedObj == null) return null;
-	    if (cachedObj.isExpired()) if (remove(cachedObj.getKey())) return null;
-	    else {
-	    	lru.put(cachedObj.getKey(), cachedObj);
-	    	removeSerializedObject(cachedObj.getKey());
-	    	return cachedObj.getObject();
-	    }
-		return null;
-	}
 	
-	/*
-	 * Set object to cache : DEFAULT_EXPIRY_TIME is used.
-	 * It will set object in LRU cache and if any object gets removed from LRU cache, system will serialize it to preserve memory.
-	 */
-	public void setObject(String key, Object object) {
-		if (!lru.containsKey(key)) {
-			CachedObject cachedObj = new CachedObject(key, object);
-			expiryPQ.add(cachedObj);
-			CachedObject removed = lru.put(key, cachedObj);
-			if (removed != null) serialize(removed);
-			System.out.println(key + " key will be expired on " + new Date(cachedObj.getExpiryTime()).toString());
-		} else System.err.println(key + " key already exists, please use different key.");
-	}
-	
-	/*
-	 * Set object to cache : User defined EXPIRY_TIME is used.
-	 * EXPIRY_TIME must be between MIN_EXPIRY_ALLOWED and MAX_EXPIRY_ALLOWED.
-	 * It will set object in LRU cache and if any object gets removed from LRU cache, system will serialize it to preserve memory.
-	 */
-	public void setObject(String key, Object object, int minutes) {
-		if (!lru.containsKey(key)) {
-			CachedObject cachedObj = new CachedObject(key, object, minutes);
-			if (cachedObj.getKey() == null) return;
-			expiryPQ.add(cachedObj);
-			CachedObject removed = lru.put(key, cachedObj);
-			if (removed != null) serialize(removed);
-			System.out.println(key + " key will be expired on " + new Date(cachedObj.getExpiryTime()).toString());
-		} else System.err.println(key + " key already exists, please use different key.");
-	}
-	
-	/*
-	 * Check if any object is expiring.
-	 * If expired removes the object from cache system.
-	 */
-	public void checkAndRemoveExpiredObjects() {
-		CachedObject obj = expiryPQ.peek();
-		//if (obj != null) System.out.println("Key " + obj.getKey() + " will be expired on " + new Date(obj.getExpiryTime()));
-		if (obj != null && obj.isExpired()) {
-			System.out.println("EXPIRED : REMOVING KEY " + obj.getKey());
-			removeSerializedObject(obj.getKey());
-			lru.remove(obj.getKey());
-			expiryPQ.poll();
-		}
-	}
-	
-	/*
-	 * Removes serialized objects from disk only.
-	 */
-	private void removeSerializedObject(String key) {
-		try {
-			File file = new File(key + ".cache");
-			if (file.delete()) System.out.println(key + " key is deleted!");
-			else System.err.println("Delete operation of key " + key + " is failed.");
-		} catch (Exception e) {
-			System.err.println(key + " key not found!");
-		}
-	}
-
-	/*
-	 * Removes objects from whole cache system.
-	 */
-	public boolean remove(String key) {
-		removeSerializedObject(key);
-		expiryPQ.remove(lru.get(key));
-		lru.remove(key);
-		return true;
+	@Override
+	protected void finalize() throws Throwable {
+		stop();
+		super.finalize();
 	}
 }
