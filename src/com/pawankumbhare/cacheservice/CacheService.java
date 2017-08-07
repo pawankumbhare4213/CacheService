@@ -44,6 +44,7 @@ public final class CacheService implements Serializable, Cloneable {
 	 * Constructor.
 	 */
 	private CacheService() {
+		if (instance != null) throw new RuntimeException("Instance already exists.");
 		// Initally system will reserve space for INITIAL_CACHE_CAPACITY times object.
 		expiryQueue = new PriorityBlockingQueue<>(INITIAL_CACHE_CAPACITY, new Comparator<CacheObject>() {
 			@Override

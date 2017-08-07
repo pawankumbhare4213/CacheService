@@ -3,7 +3,7 @@ package com.pawankumbhare.cacheservice;
 public class CacheObject {
 
 	protected static final long MAX_EXPIRE_TIME 	= 24 * 60 * 60 * 1000; // 24 hrs
-	public static final long DEFAULT_EXPIRE_TIME = 1	 * 60 * 60 * 1000; // 1 hr
+	public static final long DEFAULT_EXPIRE_TIME 	= 1	      * 60 * 1000;//1	 * 60 * 60 * 1000; // 1 hr
 	protected static final long MIN_EXPIRE_TIME 	= 1	      * 60 * 1000; // 1 min
 	
 	private String key;
